@@ -832,6 +832,8 @@ To create/register a plugin, you have to :
     #define USES_P063   // TTP229_KeyPad
     #define USES_P073   // 7DG
     #define USES_P079   // Wemos Motoshield
+    
+    #define USES_P177   // CUBIC CM1106
 #endif
 
 

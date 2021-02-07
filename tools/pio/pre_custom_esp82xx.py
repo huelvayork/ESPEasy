@@ -51,6 +51,7 @@ else:
     "-DUSES_C016",  # Cache Controller
     "-DUSES_C018",  # TTN/RN2483
 #   "-DUSES_C015",  # Blynk
+    "-DUSES_P177",  # CM1106
 
     "-DFEATURE_MDNS",
     "-DFEATURE_SD",
