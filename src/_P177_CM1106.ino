@@ -61,8 +61,7 @@ enum cm1106Commands : byte { cm1106CmdReadPPM,
 // cm1106CmdSWVer[]                = { 0x11,0x01,0x1E,0xD0 };
 // cm1106CmdSerNum[]               = { 0x11,0x01,0x1F,0xCF };
 
-// Removing redundant data, just keeping offsets [2], [6]..[7]:
-const PROGMEM byte cm1106CmdData[][10] = {
+byte cm1106CmdData[][10] = {
   { 0x11,0x01,0x01,0xED },
   { 0x11,0x07,0x10,0x64,0x00,0x07,0x01,0x90,0x64,0x78 },
   { 0x11,0x07,0x10,0x64,0x02,0x07,0x01,0x90,0x64,0x76 },
@@ -79,19 +78,6 @@ enum
   P177_ABC_enabled  = 0x00,
   P177_ABC_disabled = 0x02
 };
-
-String stringHexDump(byte theBuffer[], int len) {
-    String result;
-    result.reserve(128);
-    int counter = 0;
-
-    for (counter = 0; counter < len; counter++) {
-      result += ' ';
-      result += String(theBuffer[counter], HEX);
-    }
-
-    return result;
-  }
 
 
 struct P177_data_struct : public PluginTaskData_base {
@@ -155,6 +141,19 @@ struct P177_data_struct : public PluginTaskData_base {
     }
   }
 
+
+  String getBufferHexDump(byte *buffer) {
+    String result;
+
+    result.reserve(27);
+
+    for (int i = 0; i < buffer[1]+3; ++i) {
+      result += ' ';
+      result += String(buffer[i], HEX);
+    }
+    return result;
+  }
+
   //  Cumulative sum of data = 256-(HEAD+LEN+CMD+DATA)%256
   byte calculateChecksum(byte *buffer) {
     byte checksum = 0;
@@ -179,40 +178,83 @@ struct P177_data_struct : public PluginTaskData_base {
     }
 
     if (loglevelActiveFor(LOG_LEVEL_INFO)) {
-          String log = F("CM1106: Enviando en send_cm1106Cmd:");
-          log += getBufferHexDump();
+          String log = F("CM1106: send_cm1106Cmd:");
+          log += getBufferHexDump(cm1106CmdData[CommandId]);
           addLog(LOG_LEVEL_INFO, log);
         }
 
-    return easySerial->write(cm1106Resp, sizeof(cm1106Resp));
+    return easySerial->write(cm1106CmdData[CommandId], cm1106CmdData[CommandId][1] + 3);
   }
 
-  size_t send_cm1106CmdReadPPM(byte CommandId)
+  size_t getResponse() 
   {
-    static byte cmd[4] = {0x11,0x01,0x01,0xED}; // cm1106CmdReadPPM[]
+    // get response
+    memset(cm1106Resp, 0, sizeof(cm1106Resp));
 
-    if (!isInitialized()) { return 0; }
+    long timer   = millis() + PLUGIN_READ_TIMEOUT;
+    int  counter = 0;
+    int responseLen = 16; // max response length
 
-    if (!initTimePassed) {
-      // Allow for 1 minute of init time.
-      initTimePassed = timePassedSince(lastInitTimestamp) > 60000;
+    while (!timeOutReached(timer) && (counter < responseLen)) {
+      if (easySerial->available() > 0) {
+        byte value = easySerial->read();
+
+        if (((counter == 0) && (value == 0x16)) || (counter > 0)) {
+          cm1106Resp[counter++] = value;
+        }
+
+        if (counter == 2) { // after reading 2 bytes, we've got the length
+          responseLen = cm1106Resp[1] + 3;
+        }
+      } else {
+        delay(10);
+      }
     }
 
     if (loglevelActiveFor(LOG_LEVEL_INFO)) {
-          String log = F("CM1106: Enviando en send_cm1106CmdReadPPM:");
-          // log += String(cm1106Resp,HEX);
-          log += stringHexDump(cmd, sizeof(cmd));
-          addLog(LOG_LEVEL_INFO, log);
-        }
+      String log = F("CM1106 Received:");
+      log += getBufferHexDump(cm1106Resp);
+      // log += stringHexDump(cm1106Resp);
+      // log += String(cm1106Resp,HEX);
+      addLog(LOG_LEVEL_INFO, log);
+    }
 
-    return easySerial->write(cmd, sizeof(cmd));
+    int checksum = calculateChecksum(cm1106Resp);
+    if (!(cm1106Resp[responseLen-1] == checksum)) {
+      String log = F("CM1106 ChecksumFailed ");
+      log += String(checksum, HEX);
+      addLog(LOG_LEVEL_INFO, log);
+      ++checksumFailed;
+      return 0;
+    }
+
+    return responseLen;
+  }
+
+  bool calibrate_ppm(unsigned int ppm) {
+    if (!isInitialized()) { return false; }
+    // send read PPM command
+    byte D1, D2;
+    D1 = (int) ppm / 256;
+    D2 = (int) ppm % 256;
+    cm1106CmdData[cm1106CmdCalibrate][3] = D1;
+    cm1106CmdData[cm1106CmdCalibrate][4] = D2;
+    cm1106CmdData[cm1106CmdCalibrate][5] = calculateChecksum(cm1106CmdData[cm1106CmdCalibrate]);    
+
+    bytesRead = send_cm1106Cmd(cm1106CmdCalibrate);
+    if (bytesRead != 4) return false;
+
+    getResponse();
+    ++linesHandled;
+
+    return (cm1106Resp[2] == 0x03);
   }
 
   bool read_ppm(unsigned int& ppm) {
     if (!isInitialized()) { return false; }
 
     // send read PPM command
-    bytesRead = send_cm1106CmdReadPPM(cm1106CmdReadPPM);
+    bytesRead = send_cm1106Cmd(cm1106CmdReadPPM);
 
     if (bytesRead != 4) {
       String log = F("Bytes sent not = 4: Bytes sent ");
@@ -221,50 +263,14 @@ struct P177_data_struct : public PluginTaskData_base {
       return false;
     }
 
-    // get response
-    memset(cm1106Resp, 0, sizeof(cm1106Resp));
-
-
-    long timer   = millis() + PLUGIN_READ_TIMEOUT;
-    int  counter = 0;
-
-    while (!timeOutReached(timer) && (counter < 8)) {
-      if (easySerial->available() > 0) {
-        byte value = easySerial->read();
-
-        if (((counter == 0) && (value == 0x16)) || (counter > 0)) {
-          cm1106Resp[counter++] = value;
-        }
-      } else {
-        delay(10);
-      }
-    }
-
-    if (loglevelActiveFor(LOG_LEVEL_INFO)) {
-      String log = F("CM1106 Recibido en read_ppm:");
-      log += getBufferHexDump();
-      // log += stringHexDump(cm1106Resp);
-      // log += String(cm1106Resp,HEX);
-      addLog(LOG_LEVEL_INFO, log);
-    }
-
-
-    if (counter < 8) {
+    if (getResponse() < 8)
+    {
       // Timeout
       String log = F("CM1106 Timeout");
       addLog(LOG_LEVEL_INFO, log);
       return false;
     }
     ++linesHandled;
-
-    int checksum = calculateChecksum(cm1106Resp);
-    if (!(cm1106Resp[7] == checksum)) {
-      String log = F("CM1106 ChecksumFailed ");
-      log += String(checksum, HEX);
-      addLog(LOG_LEVEL_INFO, log);
-      ++checksumFailed;
-      return false;
-    }
 
     if ((cm1106Resp[0] == 0x16) && (cm1106Resp[1] == 0x05)) {
       // calculate CO2 PPM
@@ -275,86 +281,30 @@ struct P177_data_struct : public PluginTaskData_base {
     return true;
   }
 
-  size_t send_cm1106CmdReadSWVersion(byte CommandId)
-  {
-    static byte cmd[4] = { 0x11, 0x01, 0x1E, 0xD0 }; // cm1106CmdReadSWVersion[]
-
-    if (!isInitialized()) { return 0; }
-
-    if (!initTimePassed) {
-      // Allow for 1 minute of init time.
-      initTimePassed = timePassedSince(lastInitTimestamp) > 60000;
-    }
-
-    if (loglevelActiveFor(LOG_LEVEL_INFO)) {
-          String log = F("CM1106: Enviando en send_cm1106CmdReadSWVersion:");
-          // log += String(cm1106Resp,HEX);
-          log += stringHexDump(cmd, sizeof(cmd));
-          addLog(LOG_LEVEL_INFO, log);
-        }
-
-    return easySerial->write(cmd, sizeof(cmd));
-  }
-
   bool read_swVersion() {
     if (!isInitialized()) { return false; }
 
     // send read PPM command
-    bytesRead = send_cm1106CmdReadSWVersion(cm1106CmdReadSWVersion);
+    bytesRead = send_cm1106Cmd(cm1106CmdReadSWVersion);
 
     if (bytesRead != 4) {
-      String log = F("Bytes sent not = x in read_swVersion: Bytes sent ");
+      String log = F("Bytes sent not = 4 in read_swVersion: Bytes sent ");
           log += String(bytesRead);
           addLog(LOG_LEVEL_INFO, log);
       return false;
     }
 
-    // get response
-    memset(cm1106Resp, 0, sizeof(cm1106Resp));
-
-
-    long timer   = millis() + PLUGIN_READ_TIMEOUT;
-    int  counter = 0;
-
-    while (!timeOutReached(timer) && (counter < 15)) {
-      if (easySerial->available() > 0) {
-        byte value = easySerial->read();
-
-        if (((counter == 0) && (value == 0x16)) || (counter > 0)) {
-          cm1106Resp[counter++] = value;
-        }
-      } else {
-        delay(10);
-      }
-    }
-
-    if (loglevelActiveFor(LOG_LEVEL_INFO)) {
-      String log = F("CM1106 Recibido en read_swVersion:");
-      log += getBufferHexDump();
-      // log += stringHexDump(cm1106Resp);
-      // log += String(cm1106Resp,HEX);
-      addLog(LOG_LEVEL_INFO, log);
-    }
-
-
-    if (counter < 15) {
+    if (getResponse() < 15)
+    {
       // Timeout
       String log = F("CM1106 Timeout");
       addLog(LOG_LEVEL_INFO, log);
       return false;
     }
+
     ++linesHandled;
 
-    int checksum = calculateChecksum(cm1106Resp);
-    if (!(cm1106Resp[14] == checksum)) {
-      String log = F("CM1106 ChecksumFailed");
-      log += String(checksum, HEX);
-      addLog(LOG_LEVEL_INFO, log);
-      ++checksumFailed;
-      return false;
-    }
-
-    if ((cm1106Resp[0] == 0x16) && (cm1106Resp[1] == 0x0C)) {
+    if ((cm1106Resp[0] == 0x16) && (cm1106Resp[2] == 0x1E)) {
       // calculate CM1106 SW version
       // DF1-DF10:stand for ASCII code of software version, DF11 is reserved
       // Example:
@@ -363,53 +313,14 @@ struct P177_data_struct : public PluginTaskData_base {
       // Note: when 20 converted to ASCII code, it equals to blank space.
       // 16 0C 1E 43 4D 20 56 30 2E 30 2E 32 30 00 97
       // CM V0.0.20
-      String swVersion = "";
-      String log = F("CM1106 SW Version");
-      log += getBufferHexDump();
-      for(int k=4; k<13; k++){
-        swVersion += String(cm1106Resp[k]);
+      String swVersion = F("CM1106 SW Version: ");
+      for(int k=3; k<13; k++){
+        swVersion += (char) cm1106Resp[k];
       }
-      addLog(LOG_LEVEL_INFO, log);
       addLog(LOG_LEVEL_INFO, swVersion);
     }
 
     return true;
-  }
-
-  bool receivedCommandAcknowledgement(bool& expectReset) {
-    expectReset = false;
-
-    if (cm1106Resp[0] == 0xFF)  {
-      switch (cm1106Resp[1]) {
-        case 0x86: // Read CO2 concentration
-        case 0x79: // ON/OFF Auto Calibration
-          break;
-        case 0x87: // Calibrate Zero Point (ZERO)
-        case 0x88: // Calibrate Span Point (SPAN)
-        case 0x99: // Detection range setting
-          expectReset = true;
-          break;
-        default:
-          ++nrUnknownResponses;
-          return false;
-      }
-      byte checksum = calculateChecksum(cm1106Resp);
-      return cm1106Resp[8] == checksum;
-    }
-    ++nrUnknownResponses;
-    return false;
-  }
-
-  String getBufferHexDump() {
-    String result;
-
-    result.reserve(27);
-
-    for (int i = 0; i < 9; ++i) {
-      result += ' ';
-      result += String(cm1106Resp[i], HEX);
-    }
-    return result;
   }
 
   cm1106Types getDetectedDevice() {
@@ -547,27 +458,34 @@ boolean Plugin_177(byte function, struct EventStruct *event, String& string)
 
       String command = parseString(string, 1);
 
-      if (command == F("cm1106calibratezero"))
+      if (command == F("cm1106calibrate"))
       {
-        P177_data->send_cm1106Cmd(cm1106CmdCalibrateZero);
-        addLog(LOG_LEVEL_INFO, F("CM1106: Calibrated zero point!"));
+        float current_ppm;
+        string2float(parseString(string,2), current_ppm);
+        P177_data->calibrate_ppm(current_ppm);        
+        String log = String(F("CM1106: Calibrated to "));
+        log += current_ppm;
+        addLog(LOG_LEVEL_INFO, log);
         success = true;
       }
       else if (command == F("cm1106reset"))
       {
         P177_data->send_cm1106Cmd(cm1106CmdReset);
+        P177_data->getResponse();
         addLog(LOG_LEVEL_INFO, F("CM1106: Sent sensor reset!"));
         success = true;
       }
       else if (command == F("cm1106abcenable"))
       {
         P177_data->send_cm1106Cmd(cm1106CmdABCEnable);
+        P177_data->getResponse();
         addLog(LOG_LEVEL_INFO, F("CM1106: Sent sensor ABC Enable!"));
         success = true;
       }
       else if (command == F("cm1106abcdisable"))
       {
         P177_data->send_cm1106Cmd(cm1106CmdABCDisable);
+        P177_data->getResponse();
         addLog(LOG_LEVEL_INFO, F("CM1106: Sent sensor ABC Disable!"));
         success = true;
       }
@@ -582,11 +500,7 @@ boolean Plugin_177(byte function, struct EventStruct *event, String& string)
       }
       else if (command == F("cm1106readsoftwareversion"))
       {
-        unsigned int swVersion;
         P177_data->read_swVersion();
-        String log = F("CM1106: Read Software Version");
-        log += swVersion;
-        addLog(LOG_LEVEL_INFO, log);
         success = true;
       }
       break;
@@ -648,24 +562,11 @@ boolean Plugin_177(byte function, struct EventStruct *event, String& string)
         addLog(LOG_LEVEL_INFO, log);
         break;
 
-        // #ifdef ENABLE_DETECTION_RANGE_COMMANDS
-        // Sensor responds with 0x99 whenever we send it a measurement range adjustment
-      } else if (P177_data->receivedCommandAcknowledgement(expectReset))  {
-        addLog(LOG_LEVEL_INFO, F("CM1106: Received command acknowledgment! "));
-
-        if (expectReset) {
-          addLog(LOG_LEVEL_INFO, F("Expecting sensor reset..."));
-        }
-        success = false;
-        break;
-
-        // #endif
-
         // log verbosely anything else that the sensor reports
       } else {
         if (loglevelActiveFor(LOG_LEVEL_INFO)) {
           String log = F("CM1106: Unknown response:");
-          log += P177_data->getBufferHexDump();
+          log += P177_data->getBufferHexDump(P177_data->cm1106Resp);
           addLog(LOG_LEVEL_INFO, log);
         }
 
