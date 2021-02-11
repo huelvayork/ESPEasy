@@ -31,6 +31,8 @@
 #define PLUGIN_177_FILTER_MEDIUM         4
 #define PLUGIN_177_FILTER_SLOW           5
 
+#define PLUGIN_177_BASE_PPM            415 // based on co2.earth value.
+
 #include <ESPeasySerial.h>
 
 
@@ -461,7 +463,10 @@ boolean Plugin_177(byte function, struct EventStruct *event, String& string)
       if (command == F("cm1106calibrate"))
       {
         float current_ppm;
-        string2float(parseString(string,2), current_ppm);
+        
+        if ( ! string2float(parseString(string,2), current_ppm)) 
+          current_ppm = PLUGIN_177_BASE_PPM ;
+
         P177_data->calibrate_ppm(current_ppm);        
         String log = String(F("CM1106: Calibrated to "));
         log += current_ppm;
